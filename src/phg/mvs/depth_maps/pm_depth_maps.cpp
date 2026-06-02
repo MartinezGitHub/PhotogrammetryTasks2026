@@ -1,4 +1,6 @@
 #include "pm_depth_maps.h"
+#include <algorithm>
+#include <cmath>
 #include <libutils/fast_random.h>
 #include <libutils/timer.h>
 #include <phg/utils/point_cloud_export.h>
@@ -51,9 +53,9 @@ vector3d unproject(const vector3d& pixel, const phg::Calibration& calibration, c
 {
     double depth = pixel[2]; // на самом деле это не глубина, это координата по оси +Z (вдоль которой смотрит камера в ее локальной системе координат)
 
-    vector3d local_point; // TODO 102 пустите луч pixel из calibration а затем возьмите ан нем точку у которой по оси +Z координата=depth
+    vector3d local_point = calibration.unproject(vector2d(pixel[0], pixel[1])) * depth; // TODO 102 пустите луч pixel из calibration а затем возьмите ан нем точку у которой по оси +Z координата=depth
 
-    vector3d global_point; // TODO 103 переведите точку из локальной системы в глобальную
+    vector3d global_point = PtoWorld * homogenize(local_point); // TODO 103 переведите точку из локальной системы в глобальную
 
     return global_point;
 }
@@ -95,6 +97,8 @@ void PMDepthMapsBuilder::refinement()
     timer t;
     verbose_cout << "Iteration #" << iter << "/" << NITERATIONS << ": refinement..." << std::endl;
 
+    size_t wins[9] = {};
+
 #pragma omp parallel for schedule(dynamic, 1)
     for (ptrdiff_t j = 0; j < height; ++j) {
         for (ptrdiff_t i = 0; i < width; ++i) {
@@ -112,8 +116,11 @@ void PMDepthMapsBuilder::refinement()
                 n0 = normal_map.at<vector3f>(j, i);
 
                 // 2) случайной пертурбации текущей гипотезы (мутация и уточнение того что уже смогли найти)
-                dp = r.nextf(d0 * 0.5f, d0 * 1.5); // TODO 104: сделайте так чтобы отклонение было тем меньше, чем номер итерации ближе к NITERATIONS, улучшило ли это результат?
-                np = cv::normalize(n0 + randomNormalObservedFromCamera(cameras_RtoWorld[ref_cam], r) * 0.5); // TODO 105: сделайте так чтобы отклонение было тем меньше, чем номер итерации ближе к NITERATIONS, улучшило ли это результат?
+                float mutation_scale = float(NITERATIONS - iter + 1) / float(NITERATIONS + 1);
+                float depth_radius = (ref_depth_max - ref_depth_min) * 0.5f * mutation_scale;
+                dp = d0 == NO_DEPTH ? r.nextf(ref_depth_min, ref_depth_max) : r.nextf(d0 - depth_radius, d0 + depth_radius); // TODO 104: сделайте так чтобы отклонение было тем меньше, чем номер итерации ближе к NITERATIONS, улучшило ли это результат?
+                np = cv::normalize(n0 + randomNormalObservedFromCamera(cameras_RtoWorld[ref_cam], r) * mutation_scale); // TODO 105: сделайте так чтобы отклонение было тем меньше, чем номер итерации ближе к NITERATIONS, улучшило ли это результат?
+                // уменьшал отклонение, реузльтат стал стабильнее
 
                 dp = std::max(ref_depth_min, std::min(ref_depth_max, dp));
 
@@ -122,6 +129,8 @@ void PMDepthMapsBuilder::refinement()
                 //  - r.nextf(...)
                 //  - ref_depth_min, ref_depth_max
                 //  - randomNormalObservedFromCamera - поможет создать нормаль которая гарантированно смотрит на нас
+                dr = r.nextf(ref_depth_min, ref_depth_max);
+                nr = randomNormalObservedFromCamera(cameras_RtoWorld[ref_cam], r);
             }
 
             float best_depth = d0;
@@ -133,6 +142,7 @@ void PMDepthMapsBuilder::refinement()
 
             float depths[3] = { d0, dr, dp };
             vector3f normals[3] = { n0, nr, np };
+            size_t best_hi = 9;
 
             // перебираем все комбинации этих гипотез, т.е. 3х3=9 вариантов
             for (size_t hi = 0; hi < 3 * 3; ++hi) {
@@ -159,7 +169,14 @@ void PMDepthMapsBuilder::refinement()
                     best_normal = n;
                     best_cost = total_cost; // TODO 206: добавьте подсчет статистики, какая комбинация гипотез чаще всего побеждает? есть ли комбинации на которых мы можем сэкономить? а какие гипотезы при refinement рассматривает например
                                             // Colmap?
+                    // чаще выигрывали perturb/random гипотезы
+                    best_hi = hi;
                 }
+            }
+
+            if (best_hi < 9) {
+#pragma omp atomic
+                ++wins[best_hi];
             }
 
             depth_map.at<float>(j, i) = best_depth;
@@ -169,6 +186,13 @@ void PMDepthMapsBuilder::refinement()
     }
 
     verbose_cout << "refinement done in " << t.elapsed() << " s: ";
+    verbose_cout << "wins[";
+    for (size_t hi = 0; hi < 9; ++hi) {
+        if (hi > 0)
+            verbose_cout << ",";
+        verbose_cout << wins[hi];
+    }
+    verbose_cout << "], ";
 #ifdef VERBOSE_LOGGING
     printCurrentStats();
 #endif
@@ -211,9 +235,29 @@ void PMDepthMapsBuilder::propagation()
 #pragma omp parallel for schedule(dynamic, 1)
         for (ptrdiff_t j = 0; j < height; ++j) {
             for (ptrdiff_t i = (j + chessboard_pattern_step) % 2; i < width; i += 2) {
+                std::vector<ptrdiff_t> hypos_i;
+                std::vector<ptrdiff_t> hypos_j;
                 std::vector<float> hypos_depth;
                 std::vector<vector3f> hypos_normal;
                 std::vector<float> hypos_cost;
+                auto collectDonor = [&](ptrdiff_t ni, ptrdiff_t nj) {
+                    if (ni < 0 || ni >= width || nj < 0 || nj >= height)
+                        return;
+
+                    float d = depth_map.at<float>(nj, ni);
+                    if (d == NO_DEPTH)
+                        return;
+
+                    float cost = cost_map.at<float>(nj, ni);
+                    if (cost == NO_COST)
+                        return;
+
+                    hypos_i.push_back(ni);
+                    hypos_j.push_back(nj);
+                    hypos_depth.push_back(d);
+                    hypos_normal.push_back(normal_map.at<vector3f>(nj, ni));
+                    hypos_cost.push_back(cost);
+                };
 
                 /* 4 прямых соседа A, 8 соседей B через диагональ, 4 соседа C вдалеке (условный рисунок для PROPAGATION_STEP=5):
                  * (удобно подсвечивать через Ctrl+F)
@@ -232,25 +276,25 @@ void PMDepthMapsBuilder::propagation()
                  * o o o o o o o o o o o
                  * o o o o o C o o o o o
                  */
-                tryToPropagateDonor(i - 1, j + 0, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 0, j - 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 1, j + 0, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 0, j + 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
+                collectDonor(i - 1, j + 0);
+                collectDonor(i + 0, j - 1);
+                collectDonor(i + 1, j + 0);
+                collectDonor(i + 0, j + 1);
 
-                tryToPropagateDonor(i - 2, j - 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i - 1, j - 2, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 1, j - 2, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 2, j - 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 2, j + 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 1, j + 2, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i - 1, j + 2, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i - 2, j + 1, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
+                collectDonor(i - 2, j - 1);
+                collectDonor(i - 1, j - 2);
+                collectDonor(i + 1, j - 2);
+                collectDonor(i + 2, j - 1);
+                collectDonor(i + 2, j + 1);
+                collectDonor(i + 1, j + 2);
+                collectDonor(i - 1, j + 2);
+                collectDonor(i - 2, j + 1);
 
                 // в таких случаях очень приятно использовать множественный курсор (чтобы скопировав четыре строки выше, затем просто колесиком мышки сделать четыре каретки для того чтобы дважды вставить *PROPAGATION_STEP):
-                tryToPropagateDonor(i - 1 * PROPAGATION_STEP, j + 0 * PROPAGATION_STEP, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 0 * PROPAGATION_STEP, j - 1 * PROPAGATION_STEP, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 1 * PROPAGATION_STEP, j + 0 * PROPAGATION_STEP, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
-                tryToPropagateDonor(i + 0 * PROPAGATION_STEP, j + 1 * PROPAGATION_STEP, chessboard_pattern_step, hypos_depth, hypos_normal, hypos_cost);
+                collectDonor(i - 1 * PROPAGATION_STEP, j + 0 * PROPAGATION_STEP);
+                collectDonor(i + 0 * PROPAGATION_STEP, j - 1 * PROPAGATION_STEP);
+                collectDonor(i + 1 * PROPAGATION_STEP, j + 0 * PROPAGATION_STEP);
+                collectDonor(i + 0 * PROPAGATION_STEP, j + 1 * PROPAGATION_STEP);
 
                 // TODO 201 переделайте чтобы было как в ACMH:
                 // TODO 202 - паттерн донорства
@@ -265,10 +309,29 @@ void PMDepthMapsBuilder::propagation()
                     best_cost = NO_COST;
                 }
 
+                std::vector<std::pair<float, size_t>> donors;
                 for (size_t hi = 0; hi < hypos_depth.size(); ++hi) {
+                    if (hypos_cost[hi] != NO_COST)
+                        donors.emplace_back(hypos_cost[hi], hi);
+                }
+                std::sort(donors.begin(), donors.end());
+
+                size_t donors_limit = std::min<size_t>(8, donors.size());
+                for (size_t donor_i = 0; donor_i < donors_limit; ++donor_i) {
                     // эту гипотезу мы сейчас рассматриваем как очередного кандидата
-                    float d = hypos_depth[hi];
+                    size_t hi = donors[donor_i].second;
                     vector3f n = hypos_normal[hi];
+                    vector3d donor_point = unproject(vector3d(hypos_i[hi] + 0.5, hypos_j[hi] + 0.5, hypos_depth[hi]), calibration, cameras_PtoWorld[ref_cam]);
+                    vector3d point_on_ray = unproject(vector3d(i + 0.5, j + 0.5, 1.0), calibration, cameras_PtoWorld[ref_cam]);
+                    vector3d ref_camera_center(cameras_PtoWorld[ref_cam](0, 3), cameras_PtoWorld[ref_cam](1, 3), cameras_PtoWorld[ref_cam](2, 3));
+                    vector3d ray_dir = cv::normalize(point_on_ray - ref_camera_center);
+                    vector3d global_intersection;
+                    if (!intersectWithPlane(donor_point, n, ref_camera_center, ray_dir, global_intersection))
+                        continue;
+
+                    float d = project(global_intersection, calibration, cameras_PtoLocal[ref_cam])[2];
+                    if (d < ref_depth_min || d > ref_depth_max)
+                        continue;
 
                     // оцениваем cost для каждого соседа
                     std::vector<float> costs;
@@ -312,6 +375,9 @@ void PMDepthMapsBuilder::propagation()
 
 float PMDepthMapsBuilder::estimateCost(ptrdiff_t i, ptrdiff_t j, double d, const vector3d& global_normal, size_t neighb_cam)
 {
+    if (d == NO_DEPTH)
+        return NO_COST;
+
     vector3d pixel(i + 0.5, j + 0.5, d);
     vector3d global_point = unproject(pixel, calibration, cameras_PtoWorld[ref_cam]);
 
@@ -330,8 +396,7 @@ float PMDepthMapsBuilder::estimateCost(ptrdiff_t i, ptrdiff_t j, double d, const
             patch0.push_back(cameras_imgs_grey[ref_cam].at<unsigned char>(nj, ni) / 255.0f);
 
             vector3d point_on_ray = unproject(vector3d(ni + 0.5, nj + 0.5, 1.0), calibration, cameras_PtoWorld[ref_cam]);
-            vector3d camera_center = unproject(
-                vector3d(ni + 0.5, nj + 0.5, 0.0), calibration, cameras_PtoWorld[ref_cam]); // TODO 204: это немного неестественный способ, можно поправить его на более явный вариант, например хранить центр камер в поле cameras_O
+            vector3d camera_center(cameras_PtoWorld[ref_cam](0, 3), cameras_PtoWorld[ref_cam](1, 3), cameras_PtoWorld[ref_cam](2, 3)); // TODO 204: это немного неестественный способ, можно поправить его на более явный вариант, например хранить центр камер в поле cameras_O
 
             vector3d ray_dir = cv::normalize(point_on_ray - camera_center);
             vector3d ray_org = camera_center;
@@ -349,12 +414,22 @@ float PMDepthMapsBuilder::estimateCost(ptrdiff_t i, ptrdiff_t j, double d, const
             double y = neighb_proj[1];
 
             // TODO 205: замените этот наивный вариант nearest neighbor сэмплирования текстуры на билинейную интерполяцию (учтите что центр пикселя - .5 после запятой)
-            ptrdiff_t u = x;
-            ptrdiff_t v = y;
+            double tx = x - 0.5;
+            double ty = y - 0.5;
+            ptrdiff_t u = std::floor(tx);
+            ptrdiff_t v = std::floor(ty);
 
             // TODO 108: добавьте проверку "попали ли мы в камеру номер neighb_cam?" если не попали - возвращаем NO_COST
+            if (!(u >= 0 && u + 1 < cameras_imgs_grey[neighb_cam].cols && v >= 0 && v + 1 < cameras_imgs_grey[neighb_cam].rows))
+                return NO_COST;
 
-            float intensity = cameras_imgs_grey[neighb_cam].at<unsigned char>(v, u) / 255.0f;
+            float dx = tx - u;
+            float dy = ty - v;
+            float i00 = cameras_imgs_grey[neighb_cam].at<unsigned char>(v, u) / 255.0f;
+            float i10 = cameras_imgs_grey[neighb_cam].at<unsigned char>(v, u + 1) / 255.0f;
+            float i01 = cameras_imgs_grey[neighb_cam].at<unsigned char>(v + 1, u) / 255.0f;
+            float i11 = cameras_imgs_grey[neighb_cam].at<unsigned char>(v + 1, u + 1) / 255.0f;
+            float intensity = (1.0f - dx) * (1.0f - dy) * i00 + dx * (1.0f - dy) * i10 + (1.0f - dx) * dy * i01 + dx * dy * i11;
             patch1.push_back(intensity);
         }
     }
@@ -365,18 +440,30 @@ float PMDepthMapsBuilder::estimateCost(ptrdiff_t i, ptrdiff_t j, double d, const
     size_t n = patch0.size();
     float mean0 = 0.0f;
     float mean1 = 0.0f;
-    // ...
     for (size_t k = 0; k < n; ++k) {
         float a = patch0[k];
         float b = patch1[k];
         mean0 += a;
         mean1 += b;
-        // ...
     }
     mean0 /= n;
     mean1 /= n;
-    // ...
-    float zncc = 0.0f;
+
+    float covariance = 0.0f;
+    float variance0 = 0.0f;
+    float variance1 = 0.0f;
+    for (size_t k = 0; k < n; ++k) {
+        float a = patch0[k] - mean0;
+        float b = patch1[k] - mean1;
+        covariance += a * b;
+        variance0 += a * a;
+        variance1 += b * b;
+    }
+
+    if (variance0 <= 1e-8f || variance1 <= 1e-8f)
+        return NO_COST;
+
+    float zncc = covariance / std::sqrt(variance0 * variance1);
 
     // ZNCC в диапазоне [-1; 1], 1: идеальное совпадение, -1: ничего общего
     rassert(zncc == zncc, 23141241210380); // проверяем что не nan
@@ -407,6 +494,16 @@ float PMDepthMapsBuilder::avgCost(std::vector<float>& costs)
     // TODO 111 добавьте к этому усреднению еще одно ограничение: если cost больше чем best_cost*COSTS_K_RATIO - то такой cost подозрительно плохой и мы его не хотим учитывать (вероятно occlusion)
     // TODO 112 а что если в пикселе occlusion, но best_cost - большой и поэтому отсечение по best_cost*COSTS_K_RATIO не срабатывает? можно ли это отсечение как-то выправить для такого случая?
     // TODO 207 а что если добавить какой-нибудь бонус в случае если больше чем Х камер засчиталось? улучшается/ухудшается ли от этого что-то на herzjezu25? а при большем числе фотографий
+    // можно ограничить плохой best_cost сверху
+    float cost_limit = std::min(best_cost * COSTS_K_RATIO, 0.8f);
+    for (size_t k = 1; k < costs.size() && k < COSTS_BEST_K_LIMIT; ++k) {
+        float cost = costs[k];
+        if (cost > cost_limit)
+            break;
+
+        cost_sum += cost;
+        cost_w += 1.0f;
+    }
 
     float avg_cost = cost_sum / cost_w;
     return avg_cost;
